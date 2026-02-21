@@ -4489,7 +4489,7 @@ unsigned simt_core_cluster::get_n_active_sms() const {
     n += m_core[i]->isactive();
   return n;
 }
-
+// PAVER
 unsigned simt_core_cluster::issue_block2core() {
   unsigned num_blocks_issued = 0;
   for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++) {
@@ -4516,19 +4516,44 @@ unsigned simt_core_cluster::issue_block2core() {
       }
     }
 
-    if (m_gpu->kernel_more_cta_left(kernel) &&
-        //            (m_core[core]->get_n_active_cta() <
-        //            m_config->max_cta(*kernel)) ) {
-        m_core[core]->can_issue_1block(*kernel)) {
-      m_core[core]->issue_block2core(*kernel);
-      num_blocks_issued++;
-      m_cta_issue_next_core = core;
-      break;
+    // =========================================================================
+    // PAVER Scheduling Path
+    // =========================================================================
+    if (kernel && kernel->paver_enabled()) {
+      unsigned sid = m_config->cid_to_sid(core, m_cluster_id);
+      
+      if (m_core[core]->can_issue_1block(*kernel)) {
+        // Try to get next CTA from PAVER scheduler
+        int paver_cta_id = kernel->paver_get_next_cta_for_sm(sid);
+        
+        // If no CTA available and task stealing is enabled, try to steal
+        if (paver_cta_id < 0 && kernel->paver_task_stealing_enabled()) {
+          paver_cta_id = kernel->paver_steal_tb_for_sm(sid);
+        }
+        
+        if (paver_cta_id >= 0) {
+          m_core[core]->paver_issue_block(*kernel, (unsigned)paver_cta_id);
+          num_blocks_issued++;
+          m_cta_issue_next_core = core;
+          break;
+        }
+      }
+    } else {
+      // =========================================================================
+      // Default LRR Scheduling (original code)
+      // =========================================================================
+      if (m_gpu->kernel_more_cta_left(kernel) &&
+          m_core[core]->can_issue_1block(*kernel)) {
+        m_core[core]->issue_block2core(*kernel);
+        num_blocks_issued++;
+        m_cta_issue_next_core = core;
+        break;
+      }
     }
   }
   return num_blocks_issued;
 }
-
+// PAVER
 void simt_core_cluster::cache_flush() {
   for (unsigned i = 0; i < m_config->n_simt_cores_per_cluster; i++)
     m_core[i]->cache_flush();

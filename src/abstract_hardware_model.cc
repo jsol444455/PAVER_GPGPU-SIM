@@ -778,6 +778,11 @@ kernel_info_t::kernel_info_t(dim3 gridDim, dim3 blockDim,
       num_blocks() * entry->gpgpu_ctx->device_runtime->g_TB_launch_latency;
 
   cache_config_set = false;
+  // PAVER initialization
+  m_paver_enabled = false;
+  m_paver_task_stealing_enabled = false;
+  m_paver_steal_count = 0;
+  m_paver_use_custom_cta = false;
 }
 
 /*A snapshot of the texture mappings needs to be stored in the kernel's info as
@@ -811,6 +816,12 @@ kernel_info_t::kernel_info_t(
   cache_config_set = false;
   m_NameToCudaArray = nameToCudaArray;
   m_NameToTextureInfo = nameToTextureInfo;
+  //
+  // PAVER initialization
+  m_paver_enabled = false;
+  m_paver_task_stealing_enabled = false;
+  m_paver_steal_count = 0;
+  m_paver_use_custom_cta = false;
 }
 
 kernel_info_t::~kernel_info_t() {
@@ -909,6 +920,7 @@ void kernel_info_t::print_parent_info() {
   }
 }
 
+//////////////////
 void kernel_info_t::destroy_cta_streams() {
   printf("Destroy streams for kernel %d: ", get_uid());
   size_t stream_size = 0;
@@ -923,6 +935,222 @@ void kernel_info_t::destroy_cta_streams() {
   m_cta_streams.clear();
 }
 
+// =============================================================================
+// PAVER Implementation (Section 5 of PAVER paper)
+// =============================================================================
+void kernel_info_t::paver_init(
+    const std::vector<std::vector<unsigned>>& partition_list,
+    const std::map<unsigned, std::vector<unsigned>>& sm_assignments,
+    bool enable_task_stealing) {
+  
+  m_paver_enabled = true;
+  m_paver_task_stealing_enabled = enable_task_stealing;
+  m_paver_steal_count = 0;
+  
+  // Store partitions (TB groups)
+  m_paver_partitions.clear();
+  for (const auto& tb_list : partition_list) {
+    paver_tb_group group;
+    group.tb_ids = tb_list;
+    group.head = 0;
+    group.tail = tb_list.size();
+    m_paver_partitions.push_back(group);
+  }
+  
+  // Store SM assignments
+  m_paver_sm_assignments = sm_assignments;
+  
+  // Initialize per-SM state
+  m_paver_sm_states.clear();
+  for (const auto& kv : sm_assignments) {
+    unsigned sm_id = kv.first;
+    m_paver_sm_states[sm_id] = paver_sm_state();
+    paver_assign_next_group(sm_id);
+  }
+  
+  printf("PAVER: Initialized with %zu partitions for %zu SMs\n",
+         m_paver_partitions.size(), sm_assignments.size());
+}
+
+bool kernel_info_t::paver_assign_next_group(unsigned sm_id) {
+  if (m_paver_sm_assignments.find(sm_id) == m_paver_sm_assignments.end()) {
+    return false;
+  }
+  
+  paver_sm_state& state = m_paver_sm_states[sm_id];
+  const std::vector<unsigned>& assigned_partitions = m_paver_sm_assignments[sm_id];
+  
+  while (state.current_partition_idx < assigned_partitions.size()) {
+    unsigned part_idx = assigned_partitions[state.current_partition_idx];
+    
+    if (part_idx < m_paver_partitions.size()) {
+      paver_tb_group& group = m_paver_partitions[part_idx];
+      
+      if (!group.empty()) {
+        state.next = group.head;
+        state.tail = group.tail;
+        state.next_tb = group.tb_ids[state.next];
+        state.group_exhausted = false;
+        return true;
+      }
+    }
+    state.current_partition_idx++;
+  }
+  
+  state.group_exhausted = true;
+  state.next_tb = -1;
+  return false;
+}
+
+int kernel_info_t::paver_get_next_cta_for_sm(unsigned sm_id) {
+  if (!m_paver_enabled) {
+    return -1;
+  }
+  
+  if (m_paver_sm_states.find(sm_id) == m_paver_sm_states.end()) {
+    return -1;
+  }
+  
+  paver_sm_state& state = m_paver_sm_states[sm_id];
+  
+  if (state.next_tb >= 0 && state.next < state.tail) {
+    int tb_id = state.next_tb;
+    
+    state.next++;
+    
+    const std::vector<unsigned>& assigned = m_paver_sm_assignments[sm_id];
+    if (state.current_partition_idx < assigned.size()) {
+      unsigned part_idx = assigned[state.current_partition_idx];
+      if (state.next < state.tail && part_idx < m_paver_partitions.size()) {
+        paver_tb_group& group = m_paver_partitions[part_idx];
+        if (state.next < group.tb_ids.size()) {
+          state.next_tb = group.tb_ids[state.next];
+        } else {
+          state.next_tb = -1;
+        }
+      } else {
+        state.next_tb = -1;
+      }
+    }
+    
+    if (state.next >= state.tail) {
+      state.current_partition_idx++;
+      paver_assign_next_group(sm_id);
+    }
+    
+    return tb_id;
+  }
+  
+  if (state.group_exhausted || state.next >= state.tail) {
+    if (paver_assign_next_group(sm_id)) {
+      return paver_get_next_cta_for_sm(sm_id);
+    }
+  }
+  
+  return -1;
+}
+
+void kernel_info_t::paver_cta_completed(unsigned sm_id, unsigned cta_id) {
+  (void)sm_id;
+  (void)cta_id;
+}
+
+int kernel_info_t::paver_find_donor_sm(unsigned recipient_sm, unsigned& steal_count) {
+  unsigned max_waiting = 0;
+  unsigned total_waiting = 0;
+  int donor_sm = -1;
+  unsigned num_sms = m_paver_sm_states.size();
+  
+  for (const auto& kv : m_paver_sm_states) {
+    unsigned sm_id = kv.first;
+    const paver_sm_state& state = kv.second;
+    
+    if (sm_id == recipient_sm) continue;
+    
+    unsigned waiting = (state.tail > state.next) ? (state.tail - state.next) : 0;
+    total_waiting += waiting;
+    
+    if (waiting > max_waiting) {
+      max_waiting = waiting;
+      donor_sm = sm_id;
+    }
+  }
+  
+  if (num_sms == 0) {
+    steal_count = 0;
+    return -1;
+  }
+  
+  unsigned avg_waiting = total_waiting / num_sms;
+  steal_count = (max_waiting > avg_waiting) ? (max_waiting - avg_waiting) : 0;
+  
+  if (steal_count < 1 || max_waiting < 2) {
+    return -1;
+  }
+  
+  return donor_sm;
+}
+
+int kernel_info_t::paver_steal_tb_for_sm(unsigned sm_id) {
+  if (!m_paver_enabled || !m_paver_task_stealing_enabled) {
+    return -1;
+  }
+  
+  unsigned steal_count;
+  int donor_sm = paver_find_donor_sm(sm_id, steal_count);
+  
+  if (donor_sm < 0 || steal_count == 0) {
+    return -1;
+  }
+  
+  paver_sm_state& donor_state = m_paver_sm_states[donor_sm];
+  paver_sm_state& recipient_state = m_paver_sm_states[sm_id];
+  
+  const std::vector<unsigned>& donor_assigned = m_paver_sm_assignments[donor_sm];
+  if (donor_state.current_partition_idx >= donor_assigned.size()) {
+    return -1;
+  }
+  
+  unsigned donor_part_idx = donor_assigned[donor_state.current_partition_idx];
+  if (donor_part_idx >= m_paver_partitions.size()) {
+    return -1;
+  }
+  
+  paver_tb_group& donor_group = m_paver_partitions[donor_part_idx];
+  
+  if (donor_state.tail <= donor_state.next + 1) {
+    return -1;
+  }
+  
+  donor_state.tail--;
+  
+  int stolen_tb = donor_group.tb_ids[donor_state.tail];
+  
+  recipient_state.next_tb = stolen_tb;
+  recipient_state.group_exhausted = false;
+  
+  m_paver_steal_count++;
+  
+  return stolen_tb;
+}
+
+bool kernel_info_t::paver_has_more_ctas() const {
+  if (!m_paver_enabled) {
+    return !no_more_ctas_to_run();
+  }
+  
+  for (const auto& kv : m_paver_sm_states) {
+    const paver_sm_state& state = kv.second;
+    if (!state.group_exhausted || state.next_tb >= 0) {
+      return true;
+    }
+  }
+  return false;
+}
+// =============================================================================
+// End of PAVER Implementation
+// =============================================================================
+//
 simt_stack::simt_stack(unsigned wid, unsigned warpSize, class gpgpu_sim *gpu) {
   m_warp_id = wid;
   m_warp_size = warpSize;

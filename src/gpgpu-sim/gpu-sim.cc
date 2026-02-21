@@ -1812,6 +1812,91 @@ void shader_core_ctx::issue_block2core(kernel_info_t &kernel) {
                  free_cta_hw_id, start_thread, end_thread, m_gpu->gpu_sim_cycle,
                  m_gpu->gpu_tot_sim_cycle, kernel.get_uid(), kernel.get_name().c_str());
 }
+//////////////////////////////////////////////////////////////////////////////////////////
+
+// =============================================================================
+// PAVER: Issue a specific TB to this core
+// =============================================================================
+void shader_core_ctx::paver_issue_block(kernel_info_t &kernel, unsigned paver_cta_id) {
+  // Set PAVER's CTA ID override
+  kernel.paver_set_next_cta(paver_cta_id);
+  
+  // Rest follows issue_block2core logic but uses our overridden CTA ID
+  if (!m_config->gpgpu_concurrent_kernel_sm)
+    set_max_cta(kernel);
+  else
+    assert(occupy_shader_resource_1block(kernel, true));
+
+  kernel.inc_running();
+
+  // Find free CTA context
+  unsigned free_cta_hw_id = (unsigned)-1;
+  unsigned max_cta_per_core;
+  if (!m_config->gpgpu_concurrent_kernel_sm)
+    max_cta_per_core = kernel_max_cta_per_shader;
+  else
+    max_cta_per_core = m_config->max_cta_per_core;
+  
+  for (unsigned i = 0; i < max_cta_per_core; i++) {
+    if (m_cta_status[i] == 0) {
+      free_cta_hw_id = i;
+      break;
+    }
+  }
+  assert(free_cta_hw_id != (unsigned)-1);
+
+  // Calculate thread ranges
+  int cta_size = kernel.threads_per_cta();
+  int padded_cta_size = cta_size;
+  if (cta_size % m_config->warp_size)
+    padded_cta_size = ((cta_size / m_config->warp_size) + 1) * (m_config->warp_size);
+
+  unsigned int start_thread, end_thread;
+  if (!m_config->gpgpu_concurrent_kernel_sm) {
+    start_thread = free_cta_hw_id * padded_cta_size;
+    end_thread = start_thread + cta_size;
+  } else {
+    start_thread = find_available_hwtid(padded_cta_size, true);
+    assert((int)start_thread != -1);
+    end_thread = start_thread + cta_size;
+    assert(m_occupied_cta_to_hwtid.find(free_cta_hw_id) ==
+           m_occupied_cta_to_hwtid.end());
+    m_occupied_cta_to_hwtid[free_cta_hw_id] = start_thread;
+  }
+
+  reinit(start_thread, end_thread, false);
+
+  // Initialize threads - uses our overridden CTA ID via get_next_cta_id()
+  warp_set_t warps;
+  unsigned nthreads_in_block = 0;
+  for (unsigned i = start_thread; i < end_thread; i++) {
+    m_threadState[i].m_cta_id = free_cta_hw_id;
+    unsigned warp_id = i / m_config->warp_size;
+    nthreads_in_block += sim_init_thread(
+        kernel, &m_thread[i], m_sid, i, cta_size - (i - start_thread),
+        m_config->n_thread_per_shader, this, free_cta_hw_id, warp_id,
+        m_cluster->get_gpu());
+    m_threadState[i].m_active = true;
+    warps.set(warp_id);
+  }
+
+  assert(nthreads_in_block > 0 && nthreads_in_block <= m_config->n_thread_per_shader);
+  m_cta_status[free_cta_hw_id] = nthreads_in_block;
+  m_barriers.allocate_barrier(free_cta_hw_id, warps);
+
+  // Initialize warps
+  init_warps(free_cta_hw_id, start_thread, end_thread, paver_cta_id, cta_size, kernel);
+  m_n_active_cta++;
+
+  // Clear the override
+  kernel.paver_clear_custom_cta();
+
+  shader_CTA_count_log(m_sid, 1);
+  SHADER_DPRINTF(LIVENESS,
+                 "PAVER: shader %d issued CTA #%u @(%lld,%lld)\n",
+                 m_sid, paver_cta_id, m_gpu->gpu_sim_cycle,
+                 m_gpu->gpu_tot_sim_cycle);
+}
 
 ///////////////////////////////////////////////////////////////////////////////////////////
 

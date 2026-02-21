@@ -2081,6 +2081,8 @@ class shader_core_ctx : public core_t {
   void reinit(unsigned start_thread, unsigned end_thread,
               bool reset_not_completed);
   void issue_block2core(class kernel_info_t &kernel);
+  // PAVER: Issue a specific TB to this core
+  void paver_issue_block(kernel_info_t &kernel, unsigned paver_cta_id);
 
   void cache_flush();
   void cache_invalidate();
@@ -2540,8 +2542,26 @@ class shader_core_ctx : public core_t {
   bool occupy_shader_resource_1block(kernel_info_t &kernel, bool occupy);
   void release_shader_resource_1block(unsigned hw_ctaid, kernel_info_t &kernel);
   int find_available_hwtid(unsigned int cta_size, bool occupy);
-
+  
+  // =========================================================================
+  // PAVER: Per-SM TB Scheduling State (Section 5.1 of PAVER paper)
+  // Hardware registers: next, tail, nextTB (18 bytes per SM as per paper)
+  // =========================================================================
+  void paver_init_sm_state();
+  
  private:
+  
+  // PAVER per-SM registers (as described in paper Section 5.1)
+  struct paver_sm_registers {
+    unsigned next;      // Points to next TB in assigned group (64-bit in HW)
+    unsigned tail;      // Points to tail of assigned group (64-bit in HW)
+    int next_tb;        // Next TB ID to issue (16-bit in HW, -1 if none)
+    bool initialized;
+    
+    paver_sm_registers() : next(0), tail(0), next_tb(-1), initialized(false) {}
+  };
+  paver_sm_registers m_paver_regs;
+  
   unsigned int m_occupied_n_threads;
   unsigned int m_occupied_shmem;
   unsigned int m_occupied_regs;

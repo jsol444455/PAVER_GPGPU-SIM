@@ -268,12 +268,20 @@ class kernel_info_t {
     m_next_tid.y = 0;
     m_next_tid.z = 0;
   }
-  dim3 get_next_cta_id() const { return m_next_cta; }
+  //
+  dim3 get_next_cta_id() const { 
+    if (m_paver_use_custom_cta) return m_paver_custom_cta;
+    return m_next_cta; 
+  }
   unsigned get_next_cta_id_single() const {
+    if (m_paver_use_custom_cta) return m_paver_custom_cta_single;
     return m_next_cta.x + m_grid_dim.x * m_next_cta.y +
            m_grid_dim.x * m_grid_dim.y * m_next_cta.z;
   }
+  //
   bool no_more_ctas_to_run() const {
+    // When PAVER is actively controlling CTA issuance, don't use standard tracking
+    if (m_paver_use_custom_cta) return false;
     return (m_next_cta.x >= m_grid_dim.x || m_next_cta.y >= m_grid_dim.y ||
             m_next_cta.z >= m_grid_dim.z);
   }
@@ -339,7 +347,57 @@ class kernel_info_t {
 
   std::list<class ptx_thread_info *> m_active_threads;
   class memory_space *m_param_mem;
-
+  //
+  // =========================================================================
+  // PAVER: Private Members
+  // =========================================================================
+  struct paver_tb_group {
+      std::vector<unsigned> tb_ids;
+      unsigned head;
+      unsigned tail;
+      
+      paver_tb_group() : head(0), tail(0) {}
+      unsigned size() const { return tail - head; }
+      bool empty() const { return head >= tail; }
+  };
+  // PAVER internal state
+  bool m_paver_enabled;
+  bool m_paver_task_stealing_enabled;
+  
+  // Global queue: stores all TB groups (array of arrays as per paper Fig. 8)
+  std::vector<paver_tb_group> m_paver_partitions;
+  
+  // SM to partition assignment: sm_id -> list of partition indices
+  std::map<unsigned, std::vector<unsigned>> m_paver_sm_assignments;
+  
+  // Per-SM state: tracks which partition and position each SM is at
+  struct paver_sm_state {
+    unsigned current_partition_idx;  // Index into sm_assignments vector
+    unsigned next;                   // Points to next TB in current group
+    unsigned tail;                   // Points to tail of current group
+    int next_tb;                     // Cached next TB ID (-1 if none)
+    bool group_exhausted;            // True when current group is done
+    
+    paver_sm_state() : current_partition_idx(0), next(0), tail(0), 
+                       next_tb(-1), group_exhausted(false) {}
+  };
+  std::map<unsigned, paver_sm_state> m_paver_sm_states;
+  
+  // Statistics
+  unsigned m_paver_steal_count;
+  
+  // Helper: assign next partition group to SM
+  bool paver_assign_next_group(unsigned sm_id);
+  
+  // Helper: find donor SM for task stealing (Algorithm 2 from paper)
+  int paver_find_donor_sm(unsigned recipient_sm, unsigned& steal_count);
+  
+  // PAVER CTA Override members
+  bool m_paver_use_custom_cta;
+  dim3 m_paver_custom_cta;
+  unsigned m_paver_custom_cta_single; 
+  
+  //
  public:
   // Jin: parent and child kernel management for CDP
   void set_parent(kernel_info_t *parent, dim3 parent_ctaid, dim3 parent_tid);
@@ -354,7 +412,63 @@ class kernel_info_t {
   void destroy_cta_streams();
   void print_parent_info();
   kernel_info_t *get_parent() { return m_parent_kernel; }
-
+ //
+ // =========================================================================
+  // PAVER: TB Group Scheduling Support (Section 5 of PAVER paper)
+  // =========================================================================
+  /*
+  // TB Group structure - stores a group of TBs with high locality
+  struct paver_tb_group {
+    std::vector<unsigned> tb_ids;  // List of TB IDs in this group
+    unsigned head;                  // Index of first TB
+    unsigned tail;                  // Index of last TB + 1
+    
+    paver_tb_group() : head(0), tail(0) {}
+    unsigned size() const { return tail - head; }
+    bool empty() const { return head >= tail; }
+  };
+  */
+  // Initialize PAVER scheduling with pre-computed TB groups
+  void paver_init(const std::vector<std::vector<unsigned>>& partition_list,
+                  const std::map<unsigned, std::vector<unsigned>>& sm_assignments,
+                  bool enable_task_stealing);
+  
+  // Get the next TB to issue for a specific SM using PAVER scheduling
+  // Returns -1 if no TB available, otherwise returns linearized CTA ID
+  int paver_get_next_cta_for_sm(unsigned sm_id);
+  
+  // Called when an SM finishes a TB - updates PAVER state
+  void paver_cta_completed(unsigned sm_id, unsigned cta_id);
+  
+  // Task stealing: called when an SM has no more work
+  // Returns stolen TB ID or -1 if stealing not possible
+  int paver_steal_tb_for_sm(unsigned sm_id);
+  
+  // Check if PAVER scheduling is enabled for this kernel
+  bool paver_enabled() const { return m_paver_enabled; }
+  
+  // Check if task stealing is enabled
+  bool paver_task_stealing_enabled() const { return m_paver_task_stealing_enabled; }
+  
+  // Check if any SM still has TBs to process
+  bool paver_has_more_ctas() const;
+  
+  // Get PAVER statistics
+  unsigned paver_get_steal_count() const { return m_paver_steal_count; }
+  
+  // PAVER CTA Override - allows PAVER to specify which CTA to issue next
+  void paver_set_next_cta(unsigned linear_cta_id) {
+    m_paver_use_custom_cta = true;
+    m_paver_custom_cta_single = linear_cta_id;
+    m_paver_custom_cta.x = linear_cta_id % m_grid_dim.x;
+    m_paver_custom_cta.y = (linear_cta_id / m_grid_dim.x) % m_grid_dim.y;
+    m_paver_custom_cta.z = linear_cta_id / (m_grid_dim.x * m_grid_dim.y);
+  }
+  
+  void paver_clear_custom_cta() {
+    m_paver_use_custom_cta = false;
+  }
+ //
  private:
   kernel_info_t *m_parent_kernel;
   dim3 m_parent_ctaid;

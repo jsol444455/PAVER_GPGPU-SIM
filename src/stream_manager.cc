@@ -32,6 +32,12 @@
 #include "gpgpu-sim/gpu-sim.h"
 #include "gpgpusim_entrypoint.h"
 
+#include "/home/m/gpgpu-sim/src/gpgpu-sim/paver_config_loader.h"
+
+static paver_config_loader g_paver_config;
+static bool g_paver_config_loaded = false;
+
+
 unsigned CUstream_st::sm_next_stream_uid = 0;
 
 CUstream_st::CUstream_st() {
@@ -162,6 +168,18 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
             m_kernel->print_parent_info();
           }
           gpu->set_cache_config(m_kernel->name());
+          //
+          // PAVER init
+          if (!g_paver_config_loaded) {
+              g_paver_config_loaded = true;
+              g_paver_config.load("paver_config.txt");
+          }
+          if (g_paver_config.enabled) {
+              m_kernel->paver_init(g_paver_config.partitions, 
+                                   g_paver_config.sm_assignments, 
+                                   g_paver_config.task_stealing);
+          }
+          //
           gpu->launch(m_kernel);
         } else {
           if (m_kernel->m_launch_latency) m_kernel->m_launch_latency--;
