@@ -32,7 +32,7 @@
 #include "gpgpu-sim/gpu-sim.h"
 #include "gpgpusim_entrypoint.h"
 
-#include "/home/m/gpgpu-sim/src/gpgpu-sim/paver_config_loader.h"
+#include "/home/m/PAVER_GPGPU-SIM/src/gpgpu-sim/paver_config_loader.h"
 
 static paver_config_loader g_paver_config;
 static bool g_paver_config_loaded = false;

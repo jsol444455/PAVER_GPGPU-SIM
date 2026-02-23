@@ -11,7 +11,7 @@
 #ifndef PAVER_INTEGRATION_H
 #define PAVER_INTEGRATION_H
 
-#include "/home/m/gpgpu-sim/src/abstract_hardware_model.h"
+#include "/home/m/PAVER_GPGPU-SIM/src/abstract_hardware_model.h"
 #include <vector>
 #include <map>
 #include <string>
