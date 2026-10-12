@@ -2965,6 +2965,8 @@ void shader_core_ctx::register_cta_thread_exit(unsigned cta_num,
 
     // Jin: for concurrent kernels on sm
     release_shader_resource_1block(cta_num, *kernel);
+    // PAVER: a TB context of this SM is free again (task stealing needs it)
+    if (kernel->paver_enabled()) kernel->paver_cta_completed(m_sid);
     kernel->dec_running();
     if (!m_gpu->kernel_more_cta_left(kernel)) {
       if (!kernel->running()) {
@@ -4517,20 +4519,22 @@ unsigned simt_core_cluster::issue_block2core() {
     }
 
     // =========================================================================
-    // PAVER Scheduling Path
+    // PAVER Scheduling Path (Tripathy et al., TACO 2021, Sec. 5 / Fig. 9)
     // =========================================================================
     if (kernel && kernel->paver_enabled()) {
       unsigned sid = m_config->cid_to_sid(core, m_cluster_id);
-      
-      if (m_core[core]->can_issue_1block(*kernel)) {
-        // Try to get next CTA from PAVER scheduler
-        int paver_cta_id = kernel->paver_get_next_cta_for_sm(sid);
-        
-        // If no CTA available and task stealing is enabled, try to steal
-        if (paver_cta_id < 0 && kernel->paver_task_stealing_enabled()) {
-          paver_cta_id = kernel->paver_steal_tb_for_sm(sid);
-        }
-        
+
+      // kernel_more_cta_left() keeps -gpgpu_max_cta working and stops PAVER
+      // once every TB of the grid is issued (ptx_sim_init_thread() advances
+      // m_next_cta once per issued CTA).
+      if (m_gpu->kernel_more_cta_left(kernel) &&
+          m_core[core]->can_issue_1block(*kernel)) {
+        // Next TB of this SM's TB group; once its groups are exhausted the
+        // runtime tries task stealing (Algorithm 2). max_cta() is the number
+        // of CTAs of this kernel an SM can hold.
+        int paver_cta_id = kernel->paver_get_next_cta_for_sm(
+            sid, m_config->max_cta(*kernel));
+
         if (paver_cta_id >= 0) {
           m_core[core]->paver_issue_block(*kernel, (unsigned)paver_cta_id);
           num_blocks_issued++;

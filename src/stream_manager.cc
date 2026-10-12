@@ -32,10 +32,35 @@
 #include "gpgpu-sim/gpu-sim.h"
 #include "gpgpusim_entrypoint.h"
 
-#include "/home/m/PAVER_GPGPU-SIM/src/gpgpu-sim/paver_config_loader.h"
+#include "gpgpu-sim/paver_config_loader.h"
 
-static paver_config_loader g_paver_config;
-static bool g_paver_config_loaded = false;
+// PAVER: TB groups and SM assignment computed at JIT time (LocalityGuru +
+// paver_graph_partitioning.py). PAVER builds one locality graph per kernel,
+// so paver_config_<kernel name>.txt is used for a kernel when it exists;
+// otherwise paver_config.txt. Files are read once (working directory).
+struct paver_cached_config {
+  bool exists;
+  paver_config_loader cfg;
+};
+
+static const paver_config_loader *paver_config_for_kernel(
+    const std::string &kernel_name) {
+  static std::map<std::string, paver_cached_config> cache;
+  const std::string files[2] = {"paver_config_" + kernel_name + ".txt",
+                                "paver_config.txt"};
+  for (unsigned i = 0; i < 2; i++) {
+    std::map<std::string, paver_cached_config>::iterator it =
+        cache.find(files[i]);
+    if (it == cache.end()) {
+      paver_cached_config c;
+      c.exists = std::ifstream(files[i].c_str()).good();
+      if (c.exists) c.cfg.load(files[i]);
+      it = cache.insert(std::make_pair(files[i], c)).first;
+    }
+    if (it->second.exists) return &it->second.cfg;
+  }
+  return NULL;
+}
 
 
 unsigned CUstream_st::sm_next_stream_uid = 0;
@@ -169,15 +194,35 @@ bool stream_operation::do_operation(gpgpu_sim *gpu) {
           }
           gpu->set_cache_config(m_kernel->name());
           //
-          // PAVER init
-          if (!g_paver_config_loaded) {
-              g_paver_config_loaded = true;
-              g_paver_config.load("paver_config.txt");
-          }
-          if (g_paver_config.enabled) {
-              m_kernel->paver_init(g_paver_config.partitions, 
-                                   g_paver_config.sm_assignments, 
-                                   g_paver_config.task_stealing);
+          // PAVER: install this kernel's TB groups, after checking that they
+          // cover its grid exactly once on SMs that exist
+          {
+            const paver_config_loader *cfg =
+                paver_config_for_kernel(m_kernel->name());
+            if (cfg && cfg->enabled) {
+              unsigned num_sms = gpu->get_config().num_shader();
+              std::string why;
+              if (cfg->validate(m_kernel->num_blocks(), num_sms, why)) {
+                const shader_core_config *sc = gpu->getShaderCoreConfig();
+                m_kernel->paver_init(
+                    cfg->partitions,
+                    cfg->physical_sm_assignments(sc->n_simt_clusters,
+                                                 sc->n_simt_cores_per_cluster),
+                    cfg->task_stealing, num_sms);
+                printf(
+                    "PAVER: kernel %u '%s': %s, %zu TB groups, task stealing "
+                    "%s, SM order %s\n",
+                    m_kernel->get_uid(), m_kernel->name().c_str(),
+                    cfg->method.c_str(), cfg->partitions.size(),
+                    cfg->task_stealing ? "on" : "off", cfg->sm_order.c_str());
+              } else {
+                printf(
+                    "PAVER: kernel %u '%s': config rejected (%s); using the "
+                    "baseline TB scheduler\n",
+                    m_kernel->get_uid(), m_kernel->name().c_str(),
+                    why.c_str());
+              }
+            }
           }
           //
           gpu->launch(m_kernel);
